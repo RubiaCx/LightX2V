@@ -160,6 +160,7 @@ def fuse_scale_shift_kernel(
     else:
         # 2D: [B, C] or [1, C]  -> treat as [B, 1, C] and broadcast over L
         # 3D: [B, L, C] (or broadcastable variants like [B, 1, C], [1, L, C], [1, 1, C])
+        # Some callers may provide [L, B, C]; normalize to [B, L, C].
         # Also support scalar (0D or 1-element)
         if scale.dim() == 0 or (scale.dim() == 1 and scale.numel() == 1):
             scale_blc = scale.reshape(1)
@@ -179,6 +180,18 @@ def fuse_scale_shift_kernel(
         else:
             # broadcast later via expand if possible
             shift_blc = shift
+
+        def _maybe_swap_lb(t: torch.Tensor) -> torch.Tensor:
+            # Normalize [L, B, C] -> [B, L, C] to match x: [B, L, C]
+            try:
+                if t.dim() == 3 and t.shape[0] == L and t.shape[1] == B:
+                    return t.permute(1, 0, 2).contiguous()
+            except Exception:
+                pass
+            return t
+
+        scale_blc = _maybe_swap_lb(scale_blc)
+        shift_blc = _maybe_swap_lb(shift_blc)
 
         need_scale_scalar = scale_blc.dim() == 1 and scale_blc.numel() == 1
         need_shift_scalar = shift_blc.dim() == 1 and shift_blc.numel() == 1
