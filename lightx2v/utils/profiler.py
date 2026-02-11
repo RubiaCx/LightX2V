@@ -97,6 +97,8 @@ class _ProfilingContext:
         recorder_mode = 1: enable recorder
         recorder_mode = 2: enable recorder and force disable logger
         """
+        if recorder_mode == 0:
+            recorder_mode = GET_RECORDER_MODE()
         self.name = name
         if dist.is_initialized():
             self.rank_info = f"Rank {dist.get_rank()}"

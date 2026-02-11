@@ -30,7 +30,7 @@ from time import perf_counter
 LIGHTX2V_PATH = os.getenv("LIGHTX2V_PATH", "/home/scratch.rubchen_gpu_1/LightX2V")
 MODEL_PATH = os.getenv("WAN22_T2V_MODEL_PATH", "/home/scratch.rubchen_gpu_1/hf_cache/hub/models--Wan-AI--Wan2.2-T2V-A14B/snapshots/c8c270b13ee05bfa474194ac9fb07a5868a97cea")
 
-sys.path.append(LIGHTX2V_PATH)
+sys.path.insert(0, LIGHTX2V_PATH)
 
 from lightx2v import LightX2VPipeline  # noqa: E402
 from loguru import logger  # noqa: E402
