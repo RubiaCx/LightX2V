@@ -15,6 +15,7 @@ from lightx2v.utils.envs import *
 from lightx2v.utils.generate_task_id import generate_task_id
 from lightx2v.utils.global_paras import CALIB
 from lightx2v.utils.profiler import *
+from lightx2v.utils.profiler import stage_attach_extra_to_last
 from lightx2v.utils.utils import get_optimal_patched_size_with_sp, isotropic_crop_resize, save_to_video, wan_vae_to_comfy
 from lightx2v_platform.base.global_var import AI_DEVICE
 
@@ -375,7 +376,7 @@ class DefaultRunner(BaseRunner):
                 # 1. default do nothing
                 self.init_run_segment(segment_idx)
                 # 2. main inference loop
-                with StageContext(f"DenoisingStage(seg {segment_idx + 1}/{self.video_segment_num})") as denoise_ctx:
+                with StageContext("DenoisingStage") as denoise_ctx:
                     latents = self.run_segment(segment_idx)
                 try:
                     infer_steps = int(self.model.scheduler.infer_steps)
@@ -383,16 +384,18 @@ class DefaultRunner(BaseRunner):
                     infer_steps = 0
                 if denoise_ctx.elapsed is not None and infer_steps > 0:
                     logger.info(f"[{stage_ts()}] [DenoisingStage] average time per step: {denoise_ctx.elapsed / infer_steps:.4f} seconds")
+                    # Attach avg-per-step to the summary (best-effort)
+                    stage_attach_extra_to_last("DenoisingStage", {"avg_time_per_step_s": denoise_ctx.elapsed / infer_steps})
                 # 3. vae decoder
                 if self.config.get("use_stream_vae", False):
                     frames = []
-                    with StageContext(f"DecodingStage(seg {segment_idx + 1}/{self.video_segment_num})"):
+                    with StageContext("DecodingStage"):
                         for frame_segment in self.run_vae_decoder_stream(latents):
                             frames.append(frame_segment)
                             logger.info(f"frame sagment: {len(frames)} done")
                     self.gen_video = torch.cat(frames, dim=2)
                 else:
-                    with StageContext(f"DecodingStage(seg {segment_idx + 1}/{self.video_segment_num})"):
+                    with StageContext("DecodingStage"):
                         self.gen_video = self.run_vae_decoder(latents)
                 # 4. default do nothing
                 self.end_run_segment(segment_idx)

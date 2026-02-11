@@ -14,6 +14,7 @@ from lightx2v_platform.base.global_var import AI_DEVICE
 
 torch_device_module = getattr(torch, AI_DEVICE)
 _excluded_time_local = threading.local()
+_stage_records_local = threading.local()
 
 
 def stage_ts() -> str:
@@ -36,6 +37,98 @@ def STAGE_LOG_RANK0_ONLY() -> bool:
 
 def _is_rank0() -> bool:
     return (not dist.is_initialized()) or dist.get_rank() == 0
+
+
+def STAGE_SUMMARY_ENABLED() -> bool:
+    # Default on when stage log is enabled
+    v = os.getenv("LIGHTX2V_STAGE_SUMMARY", "")
+    if v == "":
+        return STAGE_LOG_ENABLED()
+    return v in ("1", "true", "True")
+
+
+def _get_stage_records():
+    if not hasattr(_stage_records_local, "records"):
+        _stage_records_local.records = []
+    return _stage_records_local.records
+
+
+def stage_reset():
+    _get_stage_records().clear()
+
+
+def stage_record(stage_name: str, elapsed_s: float, extra=None):
+    try:
+        rec = {"stage": stage_name, "elapsed_s": float(elapsed_s), "extra": extra or {}}
+        _get_stage_records().append(rec)
+    except Exception:
+        # best-effort; never fail inference due to logging
+        pass
+
+
+def stage_attach_extra_to_last(stage_name: str, extra: dict):
+    """Attach extra fields to the most recent record of a given stage (best-effort)."""
+    try:
+        records = _get_stage_records()
+        for i in range(len(records) - 1, -1, -1):
+            if records[i].get("stage") == stage_name:
+                ex = records[i].get("extra") or {}
+                ex.update(extra or {})
+                records[i]["extra"] = ex
+                return
+    except Exception:
+        pass
+
+
+def stage_print_summary(title: str = "StageSummary"):
+    if not STAGE_SUMMARY_ENABLED():
+        return
+    if STAGE_LOG_RANK0_ONLY() and not _is_rank0():
+        return
+
+    records = list(_get_stage_records())
+    if not records:
+        logger.info(f"[{stage_ts()}] [{title}] (no stage records)")
+        return
+
+    # Aggregate by stage name: sum and count
+    agg = {}
+    extras = {}
+    for r in records:
+        name = r.get("stage", "UnknownStage")
+        agg.setdefault(name, {"sum": 0.0, "n": 0})
+        agg[name]["sum"] += float(r.get("elapsed_s", 0.0))
+        agg[name]["n"] += 1
+        ex = r.get("extra") or {}
+        if ex:
+            extras.setdefault(name, []).append(ex)
+
+    # Prefer a stable order (common stages first)
+    preferred = [
+        "InputValidationStage",
+        "TextEncodingStage",
+        "ConditioningStage",
+        "TimestepPreparationStage",
+        "LatentPreparationStage",
+        "DenoisingStage",
+        "DecodingStage",
+    ]
+    ordered = [s for s in preferred if s in agg] + sorted([s for s in agg.keys() if s not in preferred])
+
+    logger.info(f"[{stage_ts()}] [{title}] ==============================")
+    total = 0.0
+    for s in ordered:
+        info = agg[s]
+        total += info["sum"]
+        line = f"[{stage_ts()}] [{title}] {s}: {info['sum']:.4f} seconds (n={info['n']})"
+        # If denoising has avg-per-step extras, print last one
+        if s == "DenoisingStage" and s in extras:
+            last = extras[s][-1]
+            if "avg_time_per_step_s" in last:
+                line += f", avg_per_step={float(last['avg_time_per_step_s']):.4f}s"
+        logger.info(line)
+    logger.info(f"[{stage_ts()}] [{title}] TOTAL(sum of stages): {total:.4f} seconds")
+    logger.info(f"[{stage_ts()}] [{title}] ==============================")
 
 
 class StageContext:
@@ -81,6 +174,8 @@ class StageContext:
         self.elapsed = time.perf_counter() - self._t0
         if self.enabled:
             logger.info(f"[{stage_ts()}] [{self.stage_name}] finished in {self.elapsed:.4f} seconds")
+        if self.elapsed is not None:
+            stage_record(self.stage_name, self.elapsed)
         return False
 
 
