@@ -1,13 +1,27 @@
 # torchrun --nproc_per_node=8 run_lightx2v_wan22_t2v_8gpu_c8s8_cfg0_with_warmup.py
 #
-# Goal: Make LightX2V run closer to SGLang baseline settings:
 # - steps=27, 720p, frames=81, seed=42, prompt same
 # - seq parallel = 8 (Ulysses), CFG0
-# - Print SGLang-like summary lines (avg step / denoise / decode / peak mem / e2e)
-#
-# Config file (renamed only):
-#   configs/dist_infer/wan22_moe_t2v_c8s8.json
-
+# - configs/dist_infer/wan22_moe_t2v_c8s8.json
+'''
+2026-02-10 08:33:11.613 | INFO     | __main__:<module>:243 - Video Saved in /home/scratch.rubchen_gpu_1/sglang/outputs/wan2.2_moe_t2v_c8s8_cfg0_260210082404.mp4
+2026-02-10 08:33:11.613 | INFO     | __main__:<module>:244 - done
+2026-02-10 08:33:11.613 | INFO     | __main__:<module>:246 - measure_peak_gpu_mem_gb_global_max: allocated=68.50 reserved=68.96
+2026-02-10 08:33:11.621 | INFO     | __main__:<module>:270 - ========== STATS (rank0, measure run) ==========
+2026-02-10 08:33:11.622 | INFO     | __main__:<module>:271 - TOTAL_s (pipeline): 81.410879  (source=RUN pipeline cost)
+2026-02-10 08:33:11.622 | INFO     | __main__:<module>:276 - DENOISE_s: 81.198854  (source=Run DiT cost)
+2026-02-10 08:33:11.622 | INFO     | __main__:<module>:283 - VAE_s: 1.927612  (source=Run VAE Decoder cost)
+2026-02-10 08:33:11.622 | INFO     | __main__:<module>:287 - infer_main_avg_s_per_step: 2.909278  steps_seen=27
+2026-02-10 08:33:11.622 | INFO     | __main__:<module>:292 - ===============================================
+2026-02-10 08:33:11.622 | INFO     | __main__:<module>:295 - [DenoisingStage] average time per step: 2.9093 seconds
+2026-02-10 08:33:11.622 | INFO     | __main__:<module>:297 - [DenoisingStage] finished in 81.1989 seconds
+2026-02-10 08:33:11.622 | INFO     | __main__:<module>:299 - [DecodingStage] started...
+2026-02-10 08:33:11.622 | INFO     | __main__:<module>:301 - [DecodingStage] finished in 1.9276 seconds
+2026-02-10 08:33:11.622 | INFO     | __main__:<module>:304 - Peak GPU memory (global max over ranks): allocated=68.50 GB, reserved=68.96 GB
+2026-02-10 08:33:11.622 | INFO     | __main__:<module>:310 - Pixel data generated successfully in 81.41 seconds
+2026-02-10 08:33:11.622 | INFO     | __main__:<module>:311 - Completed batch processing. Generated 1 outputs in 81.41 seconds
+2026-02-10 08:33:11.622 | INFO     | __main__:<module>:312 - Warmed-up request processed in 81.41 seconds (with warmup excluded)excluded)
+'''
 import os
 import sys
 import re
@@ -48,24 +62,51 @@ def _reset_peak_mem():
         import torch
 
         if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
+            torch.cuda.reset_peak_memory_stats(device=torch.cuda.current_device())
     except Exception:
         pass
 
 
-def _get_peak_mem_gb():
+def _get_peak_mem_bytes():
     try:
         import torch
 
         if torch.cuda.is_available():
-            return torch.cuda.max_memory_allocated() / (1024**3)
+            dev = torch.cuda.current_device()
+            allocated = int(torch.cuda.max_memory_allocated(device=dev))
+            reserved = int(torch.cuda.max_memory_reserved(device=dev))
+            return allocated, reserved
     except Exception:
         return None
     return None
 
 
+def _bytes_to_gb(x: int) -> float:
+    return float(x) / (1024**3)
+
+
+def _dist_reduce_max_bytes(pair_bytes):
+    """
+    Reduce (allocated_bytes, reserved_bytes) across ranks with MAX.
+    Returns reduced pair on all ranks if dist is initialized; otherwise returns input.
+    """
+    if pair_bytes is None:
+        return None
+    try:
+        import torch
+        import torch.distributed as dist
+
+        if not (dist.is_available() and dist.is_initialized()):
+            return pair_bytes
+
+        t = torch.tensor([pair_bytes[0], pair_bytes[1]], device="cuda" if torch.cuda.is_available() else "cpu")
+        dist.all_reduce(t, op=dist.ReduceOp.MAX)
+        return int(t[0].item()), int(t[1].item())
+    except Exception:
+        return pair_bytes
+
+
 def _parse_section(text: str, start_tag: str, end_tag: str) -> str:
-    """Return substring between the last start_tag and the following end_tag."""
     s = text.rfind(start_tag)
     if s < 0:
         return ""
@@ -76,7 +117,6 @@ def _parse_section(text: str, start_tag: str, end_tag: str) -> str:
 
 
 def _extract_last_float(block: str, pattern: str):
-    """Return last float matched by regex pattern with one capturing group."""
     vals = re.findall(pattern, block)
     if not vals:
         return None
@@ -89,7 +129,6 @@ def _extract_all_floats(block: str, pattern: str):
 
 
 def _safe_shutdown_pipe(pipe):
-    """Try best-effort shutdown to reduce leaked resources warnings."""
     for name in ["shutdown", "close", "finalize"]:
         fn = getattr(pipe, name, None)
         if callable(fn):
@@ -109,7 +148,6 @@ def _destroy_process_group():
         pass
 
 
-# -------------------- run config --------------------
 ts = datetime.now().strftime("%y%m%d%H%M%S")
 model_cls = "wan2.2_moe"
 task = "t2v"
@@ -121,9 +159,8 @@ os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(OUT_DIR, exist_ok=True)
 
 rank = _get_rank()
-is_rank0 = rank == 0
+is_rank0 = (rank == 0)
 
-# renamed tag to reflect c8s8 + cfg0 intent
 run_tag = f"{model_cls}_{task}_c8s8_cfg0_{ts}"
 log_file = os.path.join(LOG_DIR, f"{run_tag}_rank{rank}.log")
 save_result_path = os.path.join(OUT_DIR, f"{run_tag}.mp4")
@@ -143,22 +180,18 @@ pipe = LightX2VPipeline(
     task=task,
 )
 
-# IMPORTANT: config renamed only (path same)
 config_name = "wan22_moe_t2v_c8s8.json"
 pipe.create_generator(config_json=f"{LIGHTX2V_PATH}/configs/dist_infer/{config_name}")
 
-# Generation parameters
 seed = 42
 prompt = (
     "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, "
     "while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming "
     "through the window."
 )
-# prefer empty negative prompt to avoid subtle differences vs CLI default
-negative_prompt = ""
+negative_prompt = " "
 target_shape = [720, 1280]
 
-# -------------------- warmup --------------------
 WARMUP_START = f"===WARMUP_START {run_tag} rank{rank}==="
 WARMUP_END = f"===WARMUP_END {run_tag} rank{rank}==="
 
@@ -177,13 +210,23 @@ _cuda_sync()
 t1 = perf_counter()
 logger.info(WARMUP_END)
 
+warmup_peak_bytes = _get_peak_mem_bytes()
+if warmup_peak_bytes is not None:
+    logger.info(
+        "warmup_peak_gpu_mem_gb: "
+        f"allocated={_bytes_to_gb(warmup_peak_bytes[0]):.2f} "
+        f"reserved={_bytes_to_gb(warmup_peak_bytes[1]):.2f}"
+    )
+warmup_peak_bytes_max = _dist_reduce_max_bytes(warmup_peak_bytes)
 if is_rank0:
     logger.info(f"warmup_s={t1 - t0:.6f}")
-    warmup_peak_gb = _get_peak_mem_gb()
-    if warmup_peak_gb is not None:
-        logger.info(f"warmup_peak_gpu_mem_gb={warmup_peak_gb:.2f}")
+    if warmup_peak_bytes_max is not None:
+        logger.info(
+            "warmup_peak_gpu_mem_gb_global_max: "
+            f"allocated={_bytes_to_gb(warmup_peak_bytes_max[0]):.2f} "
+            f"reserved={_bytes_to_gb(warmup_peak_bytes_max[1]):.2f}"
+        )
 
-# -------------------- measure --------------------
 MEASURE_START = f"===MEASURE_START {run_tag} rank{rank}==="
 MEASURE_END = f"===MEASURE_END {run_tag} rank{rank}==="
 
@@ -204,37 +247,42 @@ t3 = perf_counter()
 logger.info(MEASURE_END)
 
 measure_s = t3 - t2
-measure_peak_gb = _get_peak_mem_gb()
+measure_peak_bytes = _get_peak_mem_bytes()
+if measure_peak_bytes is not None:
+    logger.info(
+        "measure_peak_gpu_mem_gb: "
+        f"allocated={_bytes_to_gb(measure_peak_bytes[0]):.2f} "
+        f"reserved={_bytes_to_gb(measure_peak_bytes[1]):.2f}"
+    )
+measure_peak_bytes_max = _dist_reduce_max_bytes(measure_peak_bytes)
 
 if is_rank0:
     logger.info(f"measure_s={measure_s:.6f}")
     logger.info(f"Video Saved in {save_result_path}")
     logger.info("done")
+    if measure_peak_bytes_max is not None:
+        logger.info(
+            "measure_peak_gpu_mem_gb_global_max: "
+            f"allocated={_bytes_to_gb(measure_peak_bytes_max[0]):.2f} "
+            f"reserved={_bytes_to_gb(measure_peak_bytes_max[1]):.2f}"
+        )
 
-# -------------------- parse stats (rank0 only) --------------------
-# Parse only rank0's log and only the MEASURE section to avoid mixing warmup/other runs.
 if is_rank0:
     try:
         text = open(log_file, "r", errors="ignore").read()
         block = _parse_section(text, MEASURE_START, MEASURE_END)
 
-        # Prefer explicit profiler totals if present
         dit_total = _extract_last_float(block, r"Run DiT cost\s*([0-9.]+)\s*seconds")
         vae_total = _extract_last_float(block, r"Run VAE Decoder cost\s*([0-9.]+)\s*seconds")
         pipe_total = _extract_last_float(block, r"RUN pipeline cost\s*([0-9.]+)\s*seconds")
 
-        # Per-step mean from rank0 infer_main, if present
-        infer_main_all = _extract_all_floats(
-            block, r"Rank 0 - .*?infer_main cost\s*([0-9.]+)\s*seconds"
-        )
+        infer_main_all = _extract_all_floats(block, r"Rank 0 - .*?infer_main cost\s*([0-9.]+)\s*seconds")
         infer_main_mean = (sum(infer_main_all) / len(infer_main_all)) if infer_main_all else None
         infer_main_steps = len(infer_main_all)
 
-        # Choose "best available" totals for denoise/vae/total
         denoise_total = dit_total if dit_total is not None else (sum(infer_main_all) if infer_main_all else None)
         total_total = pipe_total if pipe_total is not None else measure_s
 
-        # Clean summary
         logger.info("========== STATS (rank0, measure run) ==========")
         logger.info(
             f"TOTAL_s (pipeline): {total_total:.6f}  "
@@ -259,7 +307,6 @@ if is_rank0:
             logger.info("infer_main_avg_s_per_step: N/A")
         logger.info("===============================================")
 
-        # SGLang-like lines (approximate mapping)
         if infer_main_mean is not None:
             logger.info(f"[DenoisingStage] average time per step: {infer_main_mean:.4f} seconds")
         if denoise_total is not None:
@@ -269,10 +316,13 @@ if is_rank0:
         if vae_total is not None:
             logger.info(f"[DecodingStage] finished in {vae_total:.4f} seconds")
 
-        if measure_peak_gb is not None:
-            logger.info(f"Peak GPU memory: {measure_peak_gb:.2f} GB")
+        if measure_peak_bytes_max is not None:
+            logger.info(
+                "Peak GPU memory (global max over ranks): "
+                f"allocated={_bytes_to_gb(measure_peak_bytes_max[0]):.2f} GB, "
+                f"reserved={_bytes_to_gb(measure_peak_bytes_max[1]):.2f} GB"
+            )
 
-        # Use TOTAL_s as the closest proxy of end-to-end in measure section
         logger.info(f"Pixel data generated successfully in {total_total:.2f} seconds")
         logger.info(f"Completed batch processing. Generated 1 outputs in {total_total:.2f} seconds")
         logger.info(f"Warmed-up request processed in {total_total:.2f} seconds (with warmup excluded)")
