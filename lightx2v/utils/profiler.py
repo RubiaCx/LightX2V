@@ -1,6 +1,8 @@
 import asyncio
+import os
 import threading
 import time
+from datetime import datetime
 from functools import wraps
 
 import torch
@@ -12,6 +14,74 @@ from lightx2v_platform.base.global_var import AI_DEVICE
 
 torch_device_module = getattr(torch, AI_DEVICE)
 _excluded_time_local = threading.local()
+
+
+def stage_ts() -> str:
+    """Match style like: [02-08 09:33:11]"""
+    return datetime.now().strftime("%m-%d %H:%M:%S")
+
+
+def STAGE_LOG_ENABLED() -> bool:
+    """
+    Enable stage-style logs like:
+      [MM-DD HH:MM:SS] [TextEncodingStage] started...
+      [MM-DD HH:MM:SS] [TextEncodingStage] finished in 0.1234 seconds
+    """
+    return os.getenv("LIGHTX2V_STAGE_LOG", "0") in ("1", "true", "True")
+
+
+def STAGE_LOG_RANK0_ONLY() -> bool:
+    return os.getenv("LIGHTX2V_STAGE_RANK0_ONLY", "1") in ("1", "true", "True")
+
+
+def _is_rank0() -> bool:
+    return (not dist.is_initialized()) or dist.get_rank() == 0
+
+
+class StageContext:
+    """
+    Lightweight stage logger for end-to-end style tracing.
+
+    Controlled by env:
+      - LIGHTX2V_STAGE_LOG=1 enables logs
+      - LIGHTX2V_STAGE_RANK0_ONLY=1 prints only rank0 (default)
+      - LIGHTX2V_STAGE_SYNC=1 cuda/xpu sync at enter/exit for accurate timing (default)
+    """
+
+    def __init__(self, stage_name: str, sync=None, rank0_only=None):
+        self.stage_name = stage_name
+        if sync is None:
+            sync = os.getenv("LIGHTX2V_STAGE_SYNC", "1") in ("1", "true", "True")
+        if rank0_only is None:
+            rank0_only = STAGE_LOG_RANK0_ONLY()
+        self.sync = bool(sync)
+        self.rank0_only = bool(rank0_only)
+        self.enabled = STAGE_LOG_ENABLED() and (not self.rank0_only or _is_rank0())
+        self.elapsed = None
+
+    def _sync(self):
+        if not self.sync:
+            return
+        try:
+            # torch.cuda / torch.xpu / torch.npu provides synchronize()
+            torch_device_module.synchronize()
+        except Exception:
+            # keep stage logging best-effort; profiling contexts may still error elsewhere
+            pass
+
+    def __enter__(self):
+        if self.enabled:
+            logger.info(f"[{stage_ts()}] [{self.stage_name}] started...")
+        self._sync()
+        self._t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._sync()
+        self.elapsed = time.perf_counter() - self._t0
+        if self.enabled:
+            logger.info(f"[{stage_ts()}] [{self.stage_name}] finished in {self.elapsed:.4f} seconds")
+        return False
 
 
 def _get_excluded_time_stack():

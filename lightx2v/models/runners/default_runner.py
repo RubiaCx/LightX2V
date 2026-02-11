@@ -288,7 +288,8 @@ class DefaultRunner(BaseRunner):
     @ProfilingContext4DebugL2("Run Encoders")
     def _run_input_encoder_local_t2v(self):
         self.input_info.latent_shape = self.get_latent_shape_with_target_hw()  # Important: set latent_shape in input_info
-        text_encoder_output = self.run_text_encoder(self.input_info)
+        with StageContext("TextEncodingStage"):
+            text_encoder_output = self.run_text_encoder(self.input_info)
         torch_device_module.empty_cache()
         gc.collect()
         return {
@@ -374,16 +375,25 @@ class DefaultRunner(BaseRunner):
                 # 1. default do nothing
                 self.init_run_segment(segment_idx)
                 # 2. main inference loop
-                latents = self.run_segment(segment_idx)
+                with StageContext(f"DenoisingStage(seg {segment_idx + 1}/{self.video_segment_num})") as denoise_ctx:
+                    latents = self.run_segment(segment_idx)
+                try:
+                    infer_steps = int(self.model.scheduler.infer_steps)
+                except Exception:
+                    infer_steps = 0
+                if denoise_ctx.elapsed is not None and infer_steps > 0:
+                    logger.info(f"[{stage_ts()}] [DenoisingStage] average time per step: {denoise_ctx.elapsed / infer_steps:.4f} seconds")
                 # 3. vae decoder
                 if self.config.get("use_stream_vae", False):
                     frames = []
-                    for frame_segment in self.run_vae_decoder_stream(latents):
-                        frames.append(frame_segment)
-                        logger.info(f"frame sagment: {len(frames)} done")
+                    with StageContext(f"DecodingStage(seg {segment_idx + 1}/{self.video_segment_num})"):
+                        for frame_segment in self.run_vae_decoder_stream(latents):
+                            frames.append(frame_segment)
+                            logger.info(f"frame sagment: {len(frames)} done")
                     self.gen_video = torch.cat(frames, dim=2)
                 else:
-                    self.gen_video = self.run_vae_decoder(latents)
+                    with StageContext(f"DecodingStage(seg {segment_idx + 1}/{self.video_segment_num})"):
+                        self.gen_video = self.run_vae_decoder(latents)
                 # 4. default do nothing
                 self.end_run_segment(segment_idx)
         gen_video_final = self.process_images_after_vae_decoder()

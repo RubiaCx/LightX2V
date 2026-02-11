@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 from lightx2v.models.schedulers.scheduler import BaseScheduler
+from lightx2v.utils.profiler import StageContext
 from lightx2v.utils.utils import masks_like
 from lightx2v_platform.base.global_var import AI_DEVICE
 
@@ -29,29 +30,32 @@ class WanScheduler(BaseScheduler):
         self.head_size = self.config["dim"] // self.config["num_heads"]
 
     def prepare(self, seed, latent_shape, image_encoder_output=None):
-        if self.config["model_cls"] == "wan2.2" and self.config["task"] in ["i2v", "s2v", "rs2v"]:
-            self.vae_encoder_out = image_encoder_output["vae_encoder_out"]
+        with StageContext("ConditioningStage"):
+            if self.config["model_cls"] == "wan2.2" and self.config["task"] in ["i2v", "s2v", "rs2v"]:
+                self.vae_encoder_out = image_encoder_output["vae_encoder_out"]
 
-        self.prepare_latents(seed, latent_shape, dtype=torch.float32)
+        with StageContext("LatentPreparationStage"):
+            self.prepare_latents(seed, latent_shape, dtype=torch.float32)
 
-        alphas = np.linspace(1, 1 / self.num_train_timesteps, self.num_train_timesteps)[::-1].copy()
-        sigmas = 1.0 - alphas
-        sigmas = torch.from_numpy(sigmas).to(dtype=torch.float32)
+        with StageContext("TimestepPreparationStage"):
+            alphas = np.linspace(1, 1 / self.num_train_timesteps, self.num_train_timesteps)[::-1].copy()
+            sigmas = 1.0 - alphas
+            sigmas = torch.from_numpy(sigmas).to(dtype=torch.float32)
 
-        sigmas = self.shift * sigmas / (1 + (self.shift - 1) * sigmas)
+            sigmas = self.shift * sigmas / (1 + (self.shift - 1) * sigmas)
 
-        self.sigmas = sigmas
-        self.timesteps = sigmas * self.num_train_timesteps
+            self.sigmas = sigmas
+            self.timesteps = sigmas * self.num_train_timesteps
 
-        self.model_outputs = [None] * self.solver_order
-        self.timestep_list = [None] * self.solver_order
-        self.last_sample = None
+            self.model_outputs = [None] * self.solver_order
+            self.timestep_list = [None] * self.solver_order
+            self.last_sample = None
 
-        self.sigmas = self.sigmas.to("cpu")
-        self.sigma_min = self.sigmas[-1].item()
-        self.sigma_max = self.sigmas[0].item()
+            self.sigmas = self.sigmas.to("cpu")
+            self.sigma_min = self.sigmas[-1].item()
+            self.sigma_max = self.sigmas[0].item()
 
-        self.set_timesteps(self.infer_steps, device=AI_DEVICE, shift=self.sample_shift)
+            self.set_timesteps(self.infer_steps, device=AI_DEVICE, shift=self.sample_shift)
 
     def prepare_latents(self, seed, latent_shape, dtype=torch.float32):
         self.generator = torch.Generator(device=AI_DEVICE).manual_seed(seed)
