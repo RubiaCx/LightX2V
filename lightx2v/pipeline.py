@@ -26,7 +26,7 @@ from lightx2v.models.runners.worldplay.worldplay_bi_runner import WorldPlayBIRun
 from lightx2v.models.runners.worldplay.worldplay_distill_runner import WorldPlayDistillRunner  # noqa: F401
 from lightx2v.models.runners.z_image.z_image_runner import ZImageRunner  # noqa: F401
 from lightx2v.utils.input_info import init_empty_input_info, update_input_info_from_dict
-from lightx2v.utils.profiler import StageContext, stage_print_summary, stage_reset
+from lightx2v.utils.profiler import StageContext, StageScope, stage_print_summary, stage_reset
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
 from lightx2v.utils.set_config import set_config, set_parallel_config
 from lightx2v.utils.utils import seed_all, validate_config_paths
@@ -149,6 +149,10 @@ class LightX2VPipeline:
         norm_modulate_backend="torch",
         distilled_sigma_values=None,
     ):
+        # init/load weights happens here (before warmup/measure). Record it separately.
+        with StageScope("init"):
+            stage_reset("init")
+
         self.resize_mode = resize_mode
         if config_json is not None:
             self.set_infer_config_json(config_json)
@@ -181,7 +185,9 @@ class LightX2VPipeline:
             platform_device.init_parallel_env()
             set_parallel_config(config)
 
-        self.runner = self._init_runner(config)
+        with StageScope("init"):
+            with StageContext("LoadWeightsStage"):
+                self.runner = self._init_runner(config)
         print(self.runner.config)
         logger.info(f"Initializing {self.model_cls} runner for {self.task} task...")
         logger.info(f"Model path: {self.model_path}")
@@ -431,14 +437,17 @@ class LightX2VPipeline:
         self.target_shape = target_shape
         self.image_strength = image_strength
 
-        stage_reset()
+        stage_reset("request")
         try:
             with StageContext("InputValidationStage"):
                 input_info = init_empty_input_info(self.task)
                 seed_all(self.seed)
                 update_input_info_from_dict(input_info, self)
 
-            self.runner.run_pipeline(input_info)
+            # Alignable with sglang server `timings.total_duration_ms`:
+            # one request's end-to-end wall time on the worker (may include save, which is tracked separately).
+            with StageContext("RequestE2EStage"):
+                self.runner.run_pipeline(input_info)
         finally:
             # Print once at the very end so users can grep the tail of the log.
             stage_print_summary()

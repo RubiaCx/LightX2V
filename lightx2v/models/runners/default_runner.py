@@ -467,7 +467,10 @@ class DefaultRunner(BaseRunner):
             if not dist.is_initialized() or dist.get_rank() == 0:
                 logger.info(f"🎬 Start to save video 🎬")
 
-                save_to_video(self.gen_video_final, self.input_info.save_result_path, fps=fps, method="ffmpeg")
+                # Track save time explicitly so request E2E can be compared with
+                # server-mode metrics that exclude postprocess / saving.
+                with StageContext("SaveOutputStage"):
+                    save_to_video(self.gen_video_final, self.input_info.save_result_path, fps=fps, method="ffmpeg")
                 logger.info(f"✅ Video saved successfully to: {self.input_info.save_result_path} ✅")
             return {"video": None}
 

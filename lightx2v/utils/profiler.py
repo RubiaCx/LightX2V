@@ -15,6 +15,7 @@ from lightx2v_platform.base.global_var import AI_DEVICE
 torch_device_module = getattr(torch, AI_DEVICE)
 _excluded_time_local = threading.local()
 _stage_records_local = threading.local()
+_stage_scope_local = threading.local()
 
 
 def stage_ts() -> str:
@@ -47,20 +48,64 @@ def STAGE_SUMMARY_ENABLED() -> bool:
     return v in ("1", "true", "True")
 
 
+def STAGE_SUMMARY_INCLUDE_INIT() -> bool:
+    # Include init/load-weights summary at the end of generate()
+    return os.getenv("LIGHTX2V_STAGE_SUMMARY_INCLUDE_INIT", "1") in ("1", "true", "True")
+
+
+def _get_stage_scope() -> str:
+    if not hasattr(_stage_scope_local, "scope"):
+        _stage_scope_local.scope = "request"
+    return _stage_scope_local.scope
+
+
+def _set_stage_scope(scope: str):
+    _stage_scope_local.scope = scope
+
+
+class StageScope:
+    """Temporarily switch stage recording scope (init/request)."""
+
+    def __init__(self, scope: str):
+        self.scope = scope
+        self.prev = None
+
+    def __enter__(self):
+        self.prev = _get_stage_scope()
+        _set_stage_scope(self.scope)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.prev is not None:
+            _set_stage_scope(self.prev)
+        return False
+
+
 def _get_stage_records():
     if not hasattr(_stage_records_local, "records"):
-        _stage_records_local.records = []
+        # two buffers:
+        # - init: weights/config init (create_generator)
+        # - request: one generate/run_pipeline invocation
+        _stage_records_local.records = {"init": [], "request": []}
     return _stage_records_local.records
 
 
-def stage_reset():
-    _get_stage_records().clear()
+def stage_reset(scope: str = "request"):
+    rec = _get_stage_records()
+    if scope == "all":
+        rec["init"].clear()
+        rec["request"].clear()
+    else:
+        rec.setdefault(scope, [])
+        rec[scope].clear()
 
 
 def stage_record(stage_name: str, elapsed_s: float, extra=None):
     try:
         rec = {"stage": stage_name, "elapsed_s": float(elapsed_s), "extra": extra or {}}
-        _get_stage_records().append(rec)
+        scope = _get_stage_scope()
+        _get_stage_records().setdefault(scope, [])
+        _get_stage_records()[scope].append(rec)
     except Exception:
         # best-effort; never fail inference due to logging
         pass
@@ -69,7 +114,8 @@ def stage_record(stage_name: str, elapsed_s: float, extra=None):
 def stage_attach_extra_to_last(stage_name: str, extra: dict):
     """Attach extra fields to the most recent record of a given stage (best-effort)."""
     try:
-        records = _get_stage_records()
+        scope = _get_stage_scope()
+        records = _get_stage_records().get(scope, [])
         for i in range(len(records) - 1, -1, -1):
             if records[i].get("stage") == stage_name:
                 ex = records[i].get("extra") or {}
@@ -80,16 +126,10 @@ def stage_attach_extra_to_last(stage_name: str, extra: dict):
         pass
 
 
-def stage_print_summary(title: str = "StageSummary"):
-    if not STAGE_SUMMARY_ENABLED():
-        return
-    if STAGE_LOG_RANK0_ONLY() and not _is_rank0():
-        return
-
-    records = list(_get_stage_records())
+def _stage_print_summary_from_records(records, title: str = "StageSummary"):
     if not records:
         logger.info(f"[{stage_ts()}] [{title}] (no stage records)")
-        return
+        return 0.0
 
     # Aggregate by stage name: sum and count
     agg = {}
@@ -103,8 +143,9 @@ def stage_print_summary(title: str = "StageSummary"):
         if ex:
             extras.setdefault(name, []).append(ex)
 
-    # Prefer a stable order (common stages first)
     preferred = [
+        "LoadWeightsStage",
+        "RequestE2EStage",
         "InputValidationStage",
         "TextEncodingStage",
         "ConditioningStage",
@@ -112,23 +153,53 @@ def stage_print_summary(title: str = "StageSummary"):
         "LatentPreparationStage",
         "DenoisingStage",
         "DecodingStage",
+        "SaveOutputStage",
     ]
     ordered = [s for s in preferred if s in agg] + sorted([s for s in agg.keys() if s not in preferred])
 
     logger.info(f"[{stage_ts()}] [{title}] ==============================")
-    total = 0.0
+    total_components = 0.0
     for s in ordered:
         info = agg[s]
-        total += info["sum"]
         line = f"[{stage_ts()}] [{title}] {s}: {info['sum']:.4f} seconds (n={info['n']})"
-        # If denoising has avg-per-step extras, print last one
         if s == "DenoisingStage" and s in extras:
             last = extras[s][-1]
             if "avg_time_per_step_s" in last:
                 line += f", avg_per_step={float(last['avg_time_per_step_s']):.4f}s"
         logger.info(line)
-    logger.info(f"[{stage_ts()}] [{title}] TOTAL(sum of stages): {total:.4f} seconds")
+        # Avoid double counting: RequestE2EStage is a wall-time envelope over stages.
+        if s != "RequestE2EStage":
+            total_components += info["sum"]
+
+    # Derived metrics to align with sglang server mode:
+    # sglang `timings.total_duration_ms` excludes saving outputs, while LightX2V may include it.
+    if "RequestE2EStage" in agg:
+        req_e2e = float(agg["RequestE2EStage"]["sum"])
+        save_s = float(agg.get("SaveOutputStage", {}).get("sum", 0.0))
+        logger.info(f"[{stage_ts()}] [{title}] REQUEST_E2E(wall): {req_e2e:.4f} seconds")
+        if save_s > 0:
+            logger.info(f"[{stage_ts()}] [{title}] REQUEST_E2E(no_save): {max(req_e2e - save_s, 0.0):.4f} seconds")
+
+    logger.info(f"[{stage_ts()}] [{title}] TOTAL(sum of components, excl RequestE2EStage): {total_components:.4f} seconds")
     logger.info(f"[{stage_ts()}] [{title}] ==============================")
+    return total_components
+
+
+def stage_print_summary(title: str = "StageSummary"):
+    if not STAGE_SUMMARY_ENABLED():
+        return
+    if STAGE_LOG_RANK0_ONLY() and not _is_rank0():
+        return
+
+    rec = _get_stage_records()
+    init_total = 0.0
+    req_total = 0.0
+
+    if STAGE_SUMMARY_INCLUDE_INIT():
+        init_total = _stage_print_summary_from_records(list(rec.get("init", [])), title=f"{title}.INIT")
+    req_total = _stage_print_summary_from_records(list(rec.get("request", [])), title=f"{title}.REQUEST")
+    if STAGE_SUMMARY_INCLUDE_INIT():
+        logger.info(f"[{stage_ts()}] [{title}.E2E] INIT+REQUEST: {init_total + req_total:.4f} seconds")
 
 
 class StageContext:
